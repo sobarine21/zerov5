@@ -1,1 +1,11 @@
 streamlit
+kiteconnect
+supabase
+plotly
+scikit-learn
+lightgbm
+ta
+matplotlib
+resend
+PyMuPDF 
+google-generativeai
