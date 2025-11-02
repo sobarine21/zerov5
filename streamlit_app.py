@@ -616,4 +616,398 @@ def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str |
 def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
     st.header("2. Price Predictor with Reinforcement Learning")
     if not kite_client:
-        st.info("Login first)
+        st.info("Login first to perform ML analysis.")
+        return
+
+    historical_data = st.session_state.get("historical_data", pd.DataFrame())
+    last_symbol = st.session_state.get("last_fetched_symbol", "N/A")
+
+    if historical_data.empty:
+        st.warning("No historical data. Fetch from 'Market Data & Historical Data' first.")
+        return
+
+    st.subheader(f"1. Feature Engineering & Data Preparation for {last_symbol}")
+    
+    col_feat_eng, col_prep = st.columns(2)
+    with col_feat_eng:
+        if st.button("Generate Advanced Features (Indicators & Lags)", key="generate_features_btn"):
+            df_with_features = add_advanced_features(historical_data)
+            if not df_with_features.empty:
+                st.session_state["ml_data"] = df_with_features
+                st.session_state["ml_model"] = None
+                st.success(f"Data prepared with {len(df_with_features.columns)} features.")
+            else:
+                st.error("Failed to add features. Data might be too short or invalid.")
+                st.session_state["ml_data"] = pd.DataFrame()
+
+    ml_data = st.session_state.get("ml_data", pd.DataFrame())
+    
+    if not ml_data.empty:
+        
+        with col_prep:
+            current_prediction_horizon = st.number_input("Prediction Horizon (Periods/Days Ahead)", min_value=1, max_value=20, value=5, step=1, key="pred_horizon")
+            test_size = st.slider("Test Set Size (%)", 10, 50, 20, step=5) / 100.0
+        
+        st.markdown("---")
+        st.subheader("2. Machine Learning Model Training")
+        
+        col_ml_controls, col_ml_output = st.columns(2)
+        
+        ml_data_processed = ml_data.copy()
+        ml_data_processed['target'] = ml_data_processed['close'].shift(-current_prediction_horizon)
+        ml_data_processed.dropna(subset=['target'], inplace=True)
+        
+        features = [col for col in ml_data_processed.columns if col not in ['open', 'high', 'low', 'close', 'volume', 'target']]
+        
+        with col_ml_controls:
+            model_type_selected = st.selectbox("Select ML Model", ["LightGBM Regressor (High Performance)", "Random Forest Regressor", "Linear Regression"], key="ml_model_type_selector")
+            selected_features = st.multiselect("Select Features for Model", options=features, default=[f for f in features if f.startswith(('RSI', 'MACD', 'Lag_Close', 'SMA', 'ATR'))], key="ml_selected_features_multiselect")
+            
+            if not selected_features:
+                st.warning("Please select at least one feature.")
+                return
+
+            X = ml_data_processed[selected_features]
+            y = ml_data_processed['target']
+            
+            if X.empty or y.empty or len(X) < 100:
+                st.error("Insufficient clean data for robust training (need at least 100 samples).")
+                return
+
+            scaler = MinMaxScaler()
+            X_scaled = scaler.fit_transform(X)
+            
+            X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=test_size, random_state=42, shuffle=False)
+            st.info(f"Training data: {len(X_train)} periods, Testing data: {len(X_test)} periods")
+
+            if st.button(f"Train {model_type_selected} Model", key="train_ml_model_btn"):
+                if len(X_train) == 0 or len(X_test) == 0:
+                    st.error("Insufficient data for training/testing.")
+                    return
+                
+                model = {
+                    "Linear Regression": LinearRegression(),
+                    "Random Forest Regressor": RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42, n_jobs=-1),
+                    "LightGBM Regressor (High Performance)": lgb.LGBMRegressor(n_estimators=300, learning_rate=0.05, num_leaves=31, random_state=42, n_jobs=-1)
+                }.get(model_type_selected)
+
+                if model:
+                    with st.spinner(f"Training {model_type_selected} model for {current_prediction_horizon}-day prediction..."):
+                        model.fit(X_train, y_train)
+                        y_pred = model.predict(X_test)
+                    
+                    st.session_state["ml_model"] = model
+                    st.session_state["y_test"] = y_test
+                    st.session_state["y_pred"] = y_pred
+                    st.session_state["X_test_scaled"] = X_test
+                    st.session_state["scaler"] = scaler
+                    st.session_state["ml_features"] = selected_features
+                    st.session_state["ml_model_type"] = model_type_selected
+                    st.session_state["prediction_horizon"] = current_prediction_horizon
+                    st.success(f"{model_type_selected} Model Trained for {current_prediction_horizon}-day horizon!")
+        
+        with col_ml_output:
+            if st.session_state.get("ml_model") and st.session_state.get("y_test") is not None:
+                mse = mean_squared_error(st.session_state['y_test'], st.session_state['y_pred'])
+                rmse = np.sqrt(mse)
+                r2 = r2_score(st.session_state['y_test'], st.session_state['y_pred'])
+                
+                st.markdown(f"##### Evaluation Metrics ({st.session_state['prediction_horizon']} periods ahead)")
+                col_m1, col_m2 = st.columns(2)
+                col_m1.metric("RMSE", f"₹{rmse:.2f}")
+                col_m2.metric("R² Score", f"{r2:.4f}")
+                
+                pred_df = pd.DataFrame({'Actual': st.session_state['y_test'], 'Predicted': st.session_state['y_pred']}, index=st.session_state['y_test'].index)
+                
+                fig_pred = go.Figure()
+                fig_pred.add_trace(go.Scatter(x=pred_df.index, y=pred_df['Actual'], mode='lines', name='Actual Future Price'))
+                fig_pred.add_trace(go.Scatter(x=pred_df.index, y=pred_df['Predicted'], mode='lines', name='Predicted Future Price', line=dict(dash='dot', width=2)))
+                fig_pred.update_layout(title_text=f"Model Performance: Actual vs. Predicted Price ({st.session_state['prediction_horizon']} periods ahead)", height=500, template="plotly_white")
+                st.plotly_chart(fig_pred, use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("3. Upload Real Market Data for RL Training")
+        
+        st.info("""
+        📊 **How it works:** Upload a CSV file with real price data from the period AFTER your training data ended. 
+        The RL model will make predictions on this data and learn from the actual outcomes, adapting its correction weights.
+        
+        **Expected CSV format:**
+        - Required columns: `Date`, `OPEN`, `HIGH`, `LOW`, `CLOSE`
+        - Optional: `VOLUME`
+        - Date format: Any standard format (e.g., YYYY-MM-DD)
+        """)
+        
+        col_upload, col_process = st.columns([1, 1])
+        
+        with col_upload:
+            uploaded_file = st.file_uploader(
+                "Upload CSV with Real Market Data (Next 1 month after training)", 
+                type=['csv'],
+                key="real_data_csv_uploader"
+            )
+            
+            if uploaded_file is not None:
+                # Parse the uploaded CSV
+                real_data_df = parse_uploaded_csv(uploaded_file)
+                
+                if not real_data_df.empty:
+                    st.session_state["uploaded_real_data"] = real_data_df
+                    st.success(f"✅ Uploaded {len(real_data_df)} data points")
+                    
+                    # Show preview
+                    st.markdown("##### Data Preview:")
+                    st.dataframe(real_data_df.head(10), use_container_width=True)
+                    
+                    # Show date range
+                    st.info(f"📅 Date Range: {real_data_df.index.min().strftime('%Y-%m-%d')} to {real_data_df.index.max().strftime('%Y-%m-%d')}")
+        
+        with col_process:
+            if not st.session_state.get("uploaded_real_data", pd.DataFrame()).empty and st.session_state.get("ml_model"):
+                st.markdown("##### RL Training Status")
+                
+                real_data = st.session_state["uploaded_real_data"]
+                model = st.session_state["ml_model"]
+                scaler = st.session_state["scaler"]
+                features_list = st.session_state["ml_features"]
+                horizon = st.session_state["prediction_horizon"]
+                
+                st.write(f"Model ready: ✅")
+                st.write(f"Real data loaded: ✅ ({len(real_data)} points)")
+                st.write(f"Prediction horizon: {horizon} periods")
+                
+                if st.button("🚀 Train RL on Real Data", key="train_rl_real_data_btn"):
+                    with st.spinner("Training RL model on real market movements..."):
+                        predictions_made = train_rl_on_real_data(
+                            model=model,
+                            scaler=scaler,
+                            features_list=features_list,
+                            real_data_df=real_data,
+                            horizon=horizon,
+                            symbol=last_symbol
+                        )
+                        
+                        if predictions_made > 0:
+                            st.session_state["rl_training_complete"] = True
+                            st.success(f"🎉 RL Training Complete! Made {predictions_made} predictions and learned from actual outcomes.")
+                            
+                            # Show improvement metrics
+                            rl_metrics = calculate_rl_metrics()
+                            if rl_metrics:
+                                col_rl1, col_rl2 = st.columns(2)
+                                col_rl1.metric("Predictions Made", predictions_made)
+                                col_rl2.metric("Avg Error", f"{rl_metrics['avg_recent_error']:.2f}%")
+                            
+                            st.rerun()
+                        else:
+                            st.error("No predictions could be made. Check data compatibility.")
+            else:
+                if not st.session_state.get("ml_model"):
+                    st.warning("⚠️ Train the ML model first")
+                else:
+                    st.info("📤 Upload real market data to begin RL training")
+
+        st.markdown("---")
+        st.subheader(f"4. Next Prediction: Forecasting {last_symbol}")
+
+        if st.session_state.get("ml_model") and not ml_data.empty:
+            model = st.session_state["ml_model"]
+            scaler = st.session_state["scaler"]
+            features_list = st.session_state["ml_features"]
+            horizon = st.session_state["prediction_horizon"]
+            
+            latest_row = ml_data[features_list].iloc[[-1]] 
+            latest_row_scaled = scaler.transform(latest_row)
+            
+            col_forecast_btn, col_forecast_display = st.columns([1, 2])
+            
+            with col_forecast_btn:
+                if st.button(f"🔮 Generate Forecast for Next {horizon} Periods", key="generate_forecast_btn"):
+                    
+                    with st.spinner(f"Predicting next {horizon} periods..."):
+                        base_prediction = model.predict(latest_row_scaled)[0]
+                        
+                        # Apply RL correction if trained
+                        if st.session_state["rl_enabled"] and st.session_state["rl_correction_model"] is not None:
+                            corrector = st.session_state["rl_correction_model"]
+                            if corrector.n_updates > 0:
+                                forecasted_price = apply_rl_correction(base_prediction, latest_row_scaled[0])
+                                rl_applied = True
+                            else:
+                                forecasted_price = base_prediction
+                                rl_applied = False
+                        else:
+                            forecasted_price = base_prediction
+                            rl_applied = False
+                    
+                    last_known_close = historical_data['close'].iloc[-1]
+                    predicted_change = ((forecasted_price - last_known_close) / last_known_close) * 100
+
+                    # Store this prediction
+                    st.session_state["last_forecast"] = {
+                        'timestamp': datetime.now(),
+                        'symbol': last_symbol,
+                        'predicted_price': forecasted_price,
+                        'base_prediction': base_prediction,
+                        'base_price': last_known_close,
+                        'features': latest_row_scaled[0],
+                        'horizon': horizon,
+                        'rl_applied': rl_applied
+                    }
+
+                    st.success(f"Forecast Generated using **{st.session_state['ml_model_type']}** model" + 
+                             (" with RL enhancement! ✨" if rl_applied else ""))
+            
+            with col_forecast_display:
+                if st.session_state.get("last_forecast"):
+                    forecast = st.session_state["last_forecast"]
+                    last_known_close = forecast['base_price']
+                    forecasted_price = forecast['predicted_price']
+                    predicted_change = ((forecasted_price - last_known_close) / last_known_close) * 100
+                    
+                    col_f1, col_f2, col_f3 = st.columns(3)
+                    col_f1.metric("Last Known Close", f"₹{last_known_close:.2f}")
+                    col_f2.metric(f"Predicted Price ({forecast['horizon']} periods)", 
+                                         f"₹{forecasted_price:.2f}", 
+                                         delta=f"{predicted_change:.2f}%")
+                    col_f3.metric("Forecast Date", 
+                                         (historical_data.index[-1] + timedelta(days=forecast['horizon'])).strftime('%Y-%m-%d'))
+                    
+                    if forecast['rl_applied']:
+                        base_pred = forecast['base_prediction']
+                        rl_correction = forecasted_price - base_pred
+                        st.info(f"🤖 RL Correction Applied: ₹{rl_correction:+.2f} from base prediction")
+                    
+                    if predicted_change > 2:
+                        st.success(f"📈 **Strong BUY Signal** - Expected rise of {predicted_change:.2f}%")
+                    elif predicted_change > 0:
+                        st.info(f"📈 **Mild BUY/HOLD** - Expected rise of {predicted_change:.2f}%")
+                    elif predicted_change < -2:
+                        st.error(f"📉 **Strong SELL Signal** - Expected drop of {abs(predicted_change):.2f}%")
+                    elif predicted_change < 0:
+                        st.warning(f"📉 **Mild SELL/HOLD** - Expected drop of {abs(predicted_change):.2f}%")
+                    else:
+                        st.info("➡️ **Neutral** - Minimal price change predicted")
+
+        # Display RL Learning History
+        if st.session_state["rl_memory"] and len(st.session_state["rl_memory"]) > 5:
+            st.markdown("---")
+            st.subheader("5. RL Learning History & Performance Analytics")
+            
+            col_rl1, col_rl2 = st.columns([2, 1])
+            
+            with col_rl1:
+                # Plot error progression over time
+                memory_df = pd.DataFrame([
+                    {
+                        'index': idx,
+                        'timestamp': entry['timestamp'],
+                        'error_pct': abs(entry['error_pct']),
+                        'symbol': entry['symbol']
+                    }
+                    for idx, entry in enumerate(st.session_state["rl_memory"])
+                ])
+                
+                fig_rl = go.Figure()
+                fig_rl.add_trace(go.Scatter(
+                    x=memory_df['index'], 
+                    y=memory_df['error_pct'],
+                    mode='lines+markers',
+                    name='Prediction Error %',
+                    line=dict(color='#FF6B6B', width=2),
+                    marker=dict(size=4)
+                ))
+                
+                # Add trend line
+                if len(memory_df) > 10:
+                    z = np.polyfit(memory_df['index'], memory_df['error_pct'], 1)
+                    p = np.poly1d(z)
+                    fig_rl.add_trace(go.Scatter(
+                        x=memory_df['index'],
+                        y=p(memory_df['index']),
+                        mode='lines',
+                        name='Learning Trend',
+                        line=dict(color='#4ECDC4', dash='dash', width=3)
+                    ))
+                
+                fig_rl.update_layout(
+                    title_text="RL Learning Progress: Prediction Error Over Time",
+                    xaxis_title="Prediction Number",
+                    yaxis_title="Absolute Error %",
+                    height=400,
+                    template="plotly_white",
+                    hovermode='x unified'
+                )
+                st.plotly_chart(fig_rl, use_container_width=True)
+            
+            with col_rl2:
+                rl_metrics = calculate_rl_metrics()
+                if rl_metrics:
+                    st.markdown("##### RL Performance Stats")
+                    st.metric("Total Predictions", rl_metrics['total_predictions'])
+                    st.metric("Best Error", f"{rl_metrics['best_prediction_error']:.2f}%")
+                    st.metric("Recent Avg Error", f"{rl_metrics['avg_recent_error']:.2f}%")
+                    
+                    improvement = rl_metrics['improvement']
+                    st.metric("Improvement", 
+                             f"{improvement:.2f}%",
+                             delta=f"{improvement:.2f}%" if improvement > 0 else None,
+                             delta_color="normal" if improvement > 0 else "inverse")
+                    
+                    if rl_metrics['total_predictions'] > 50:
+                        accuracy = 100 - rl_metrics['avg_recent_error']
+                        st.metric("Model Accuracy", f"{accuracy:.1f}%")
+            
+            # Show recent predictions table
+            st.markdown("##### Recent Predictions Log (Last 15)")
+            recent_predictions = st.session_state["rl_memory"][-15:][::-1]
+            
+            log_df = pd.DataFrame([
+                {
+                    'Time': entry['timestamp'].strftime('%Y-%m-%d %H:%M') if isinstance(entry['timestamp'], datetime) else str(entry['timestamp']),
+                    'Symbol': entry['symbol'],
+                    'Predicted': f"₹{entry['predicted']:.2f}",
+                    'Actual': f"₹{entry['actual']:.2f}",
+                    'Error': f"₹{entry['error']:.2f}",
+                    'Error %': f"{entry['error_pct']:.2f}%"
+                }
+                for entry in recent_predictions
+            ])
+            
+            st.dataframe(log_df, use_container_width=True, hide_index=True)
+            
+            # Download option for full history
+            if st.button("📥 Download Full RL Training History", key="download_rl_history"):
+                full_history = pd.DataFrame([
+                    {
+                        'Timestamp': entry['timestamp'],
+                        'Symbol': entry['symbol'],
+                        'Predicted_Price': entry['predicted'],
+                        'Actual_Price': entry['actual'],
+                        'Error': entry['error'],
+                        'Error_Percentage': entry['error_pct']
+                    }
+                    for entry in st.session_state["rl_memory"]
+                ])
+                
+                csv = full_history.to_csv(index=False)
+                st.download_button(
+                    label="Download CSV",
+                    data=csv,
+                    file_name=f"rl_training_history_{last_symbol}_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv"
+                )
+
+
+# --- Main Application Logic ---
+api_key = KITE_CREDENTIALS["api_key"]
+access_token = st.session_state["kite_access_token"]
+
+tabs = st.tabs(["📊 Market Data & Historical", "🤖 ML Price Predictor + RL Training"])
+tab_market, tab_ml = tabs
+
+with tab_market: 
+    render_market_historical_tab(k, api_key, access_token)
+    
+with tab_ml: 
+    render_price_predictor_tab(k, api_key, access_token)
