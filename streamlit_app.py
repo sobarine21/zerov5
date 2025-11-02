@@ -452,16 +452,32 @@ class AdaptivePredictionCorrector:
         self.weights = np.zeros(n_features + 1)  # +1 for bias
         self.learning_rate = learning_rate
         self.error_history = []
-        self.n_updates = 0
+        self.n_updates = 0  # Initialize n_updates here
+        self.n_features = n_features
         
     def predict_correction(self, features, base_prediction):
         """Predict correction factor to apply to base model prediction"""
+        # Ensure features is the right shape
+        if len(features) != self.n_features:
+            # Pad or truncate if needed
+            if len(features) < self.n_features:
+                features = np.pad(features, (0, self.n_features - len(features)), 'constant')
+            else:
+                features = features[:self.n_features]
+        
         X = np.append(features, 1)  # Add bias term
         correction = np.dot(self.weights, X)
         return base_prediction + correction
     
     def update(self, features, predicted_price, actual_price):
         """Update weights based on prediction error using gradient descent"""
+        # Ensure features is the right shape
+        if len(features) != self.n_features:
+            if len(features) < self.n_features:
+                features = np.pad(features, (0, self.n_features - len(features)), 'constant')
+            else:
+                features = features[:self.n_features]
+        
         X = np.append(features, 1)
         error = actual_price - predicted_price
         self.error_history.append(abs(error))
