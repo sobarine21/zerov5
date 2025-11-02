@@ -544,15 +544,33 @@ def train_rl_on_real_data(model, scaler, features_list, real_data_df, horizon, s
         predictions_made = 0
         errors_list = []
         
-        # Initialize RL model if not exists
+        # Initialize or recreate RL model
+        n_features = len(features_list)
+        
+        # Check if existing model is valid, if not recreate it
+        if st.session_state["rl_correction_model"] is not None:
+            try:
+                # Test if model has required attributes
+                _ = st.session_state["rl_correction_model"].n_updates
+            except AttributeError:
+                # Model is old version, recreate it
+                st.warning("Recreating RL model due to version mismatch...")
+                st.session_state["rl_correction_model"] = None
+        
         if st.session_state["rl_correction_model"] is None:
-            n_features = len(features_list)
             st.session_state["rl_correction_model"] = AdaptivePredictionCorrector(
                 n_features, 
                 learning_rate=st.session_state["rl_learning_rate"]
             )
+            st.info(f"Initialized new RL correction model with {n_features} features")
         
         corrector = st.session_state["rl_correction_model"]
+        
+        # Verify the corrector has n_updates attribute
+        if not hasattr(corrector, 'n_updates'):
+            st.error("RL model missing n_updates attribute, recreating...")
+            corrector = AdaptivePredictionCorrector(n_features, learning_rate=st.session_state["rl_learning_rate"])
+            st.session_state["rl_correction_model"] = corrector
         
         # Calculate how many predictions we can make
         max_predictions = len(real_data_with_features) - horizon
@@ -624,6 +642,8 @@ def train_rl_on_real_data(model, scaler, features_list, real_data_df, horizon, s
                 
             except Exception as e:
                 st.warning(f"Error at iteration {i}: {str(e)}")
+                import traceback
+                st.error(traceback.format_exc())
                 continue
         
         # Clear progress indicators
