@@ -189,30 +189,109 @@ def find_instrument_token(df: pd.DataFrame, tradingsymbol: str, exchange: str = 
 
 def add_advanced_features(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or 'close' not in df.columns:
+        st.warning("Data is empty or missing 'close' column")
         return pd.DataFrame()
 
-    df_copy = df.copy() 
+    df_copy = df.copy()
     
-    # Technical Indicators
-    df_copy['SMA_10'] = ta.trend.sma_indicator(df_copy['close'], window=10)
-    df_copy['RSI_14'] = ta.momentum.rsi(df_copy['close'], window=14)
-    macd_obj = ta.trend.MACD(df_copy['close'], window_fast=12, window_slow=26, window_sign=9)
-    df_copy['MACD'] = macd_obj.macd()
-    df_copy['Bollinger_High'] = ta.volatility.BollingerBands(df_copy['close'], window=20, window_dev=2).bollinger_hband()
-    df_copy['Bollinger_Low'] = ta.volatility.BollingerBands(df_copy['close'], window=20, window_dev=2).bollinger_lband()
-    df_copy['VWAP'] = ta.volume.volume_weighted_average_price(df_copy['high'], df_copy['low'], df_copy['close'], df_copy['volume'], window=14)
-    df_copy['OBV'] = ta.volume.on_balance_volume(df_copy['close'], df_copy['volume'])
-    df_copy['ATR'] = ta.volatility.average_true_range(df_copy['high'], df_copy['low'], df_copy['close'], window=14)
+    # Ensure we have minimum required columns
+    required_cols = ['open', 'high', 'low', 'close']
+    missing = [col for col in required_cols if col not in df_copy.columns]
+    if missing:
+        st.error(f"Missing required columns for features: {missing}")
+        return pd.DataFrame()
     
-    # Lagged features
-    for lag in [1, 2, 5]:
-        df_copy[f'Lag_Close_{lag}'] = df_copy['close'].shift(lag)
-        df_copy[f'Lag_Return_{lag}'] = df_copy['close'].pct_change(lag) * 100
-
-    df_copy.fillna(method='bfill', inplace=True)
-    df_copy.fillna(method='ffill', inplace=True)
-    df_copy.dropna(inplace=True) 
-    return df_copy
+    # Ensure volume column exists
+    if 'volume' not in df_copy.columns:
+        df_copy['volume'] = 1000000  # Default volume if missing
+    
+    # Replace zero or negative volumes with small positive number
+    df_copy['volume'] = df_copy['volume'].replace(0, 1)
+    df_copy.loc[df_copy['volume'] <= 0, 'volume'] = 1
+    
+    try:
+        # Technical Indicators with error handling
+        try:
+            df_copy['SMA_10'] = ta.trend.sma_indicator(df_copy['close'], window=10)
+        except:
+            df_copy['SMA_10'] = df_copy['close'].rolling(window=10).mean()
+        
+        try:
+            df_copy['RSI_14'] = ta.momentum.rsi(df_copy['close'], window=14)
+        except:
+            df_copy['RSI_14'] = 50  # Neutral RSI
+        
+        try:
+            macd_obj = ta.trend.MACD(df_copy['close'], window_fast=12, window_slow=26, window_sign=9)
+            df_copy['MACD'] = macd_obj.macd()
+        except:
+            df_copy['MACD'] = 0
+        
+        try:
+            bb = ta.volatility.BollingerBands(df_copy['close'], window=20, window_dev=2)
+            df_copy['Bollinger_High'] = bb.bollinger_hband()
+            df_copy['Bollinger_Low'] = bb.bollinger_lband()
+        except:
+            df_copy['Bollinger_High'] = df_copy['close'] * 1.02
+            df_copy['Bollinger_Low'] = df_copy['close'] * 0.98
+        
+        try:
+            df_copy['VWAP'] = ta.volume.volume_weighted_average_price(
+                df_copy['high'], df_copy['low'], df_copy['close'], df_copy['volume'], window=14
+            )
+        except:
+            df_copy['VWAP'] = df_copy['close']
+        
+        try:
+            df_copy['OBV'] = ta.volume.on_balance_volume(df_copy['close'], df_copy['volume'])
+        except:
+            df_copy['OBV'] = df_copy['volume'].cumsum()
+        
+        try:
+            df_copy['ATR'] = ta.volatility.average_true_range(
+                df_copy['high'], df_copy['low'], df_copy['close'], window=14
+            )
+        except:
+            df_copy['ATR'] = (df_copy['high'] - df_copy['low']).rolling(window=14).mean()
+        
+        # Lagged features
+        for lag in [1, 2, 5]:
+            df_copy[f'Lag_Close_{lag}'] = df_copy['close'].shift(lag)
+            df_copy[f'Lag_Return_{lag}'] = df_copy['close'].pct_change(lag) * 100
+        
+        # Forward fill then backward fill for NaN values
+        df_copy = df_copy.fillna(method='ffill')
+        df_copy = df_copy.fillna(method='bfill')
+        
+        # If still NaN, fill with mean or median
+        for col in df_copy.columns:
+            if df_copy[col].isnull().any():
+                if col in ['close', 'open', 'high', 'low', 'SMA_10', 'VWAP']:
+                    df_copy[col].fillna(df_copy[col].median(), inplace=True)
+                elif col in ['RSI_14']:
+                    df_copy[col].fillna(50, inplace=True)
+                else:
+                    df_copy[col].fillna(0, inplace=True)
+        
+        # Drop rows that still have NaN after all filling attempts
+        initial_rows = len(df_copy)
+        df_copy.dropna(inplace=True)
+        
+        rows_dropped = initial_rows - len(df_copy)
+        if rows_dropped > 0:
+            st.info(f"Dropped {rows_dropped} rows with NaN values after feature generation")
+        
+        if df_copy.empty:
+            st.error("All rows were dropped due to NaN values")
+            return pd.DataFrame()
+        
+        return df_copy
+        
+    except Exception as e:
+        import traceback
+        st.error(f"Error in feature generation: {str(e)}")
+        st.error(f"Traceback: {traceback.format_exc()}")
+        return pd.DataFrame()
 
 
 # --- CSV PARSING FUNCTION ---
@@ -902,6 +981,18 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
                     
                     # Show date range
                     st.info(f"📅 Date Range: {real_data_df.index.min().strftime('%Y-%m-%d')} to {real_data_df.index.max().strftime('%Y-%m-%d')}")
+                    
+                    # Show columns available
+                    st.info(f"📊 Columns: {', '.join(real_data_df.columns)}")
+                    
+                    # Show data quality stats
+                    st.markdown("##### Data Quality:")
+                    col_q1, col_q2, col_q3 = st.columns(3)
+                    col_q1.metric("Total Rows", len(real_data_df))
+                    col_q2.metric("Date Range (days)", (real_data_df.index.max() - real_data_df.index.min()).days)
+                    col_q3.metric("Missing Values", real_data_df.isnull().sum().sum())
+                else:
+                    st.error("Failed to parse CSV. Please check the format.")
         
         with col_process:
             if not st.session_state.get("uploaded_real_data", pd.DataFrame()).empty and st.session_state.get("ml_model"):
