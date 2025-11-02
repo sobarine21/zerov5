@@ -228,41 +228,49 @@ def parse_uploaded_csv(uploaded_file) -> pd.DataFrame:
         # Create column mapping (case-insensitive)
         col_map = {}
         for col in df.columns:
-            col_lower = col.lower()
+            col_lower = col.lower().replace(' ', '').replace('.', '')
             if 'date' in col_lower:
                 col_map[col] = 'date'
-            elif 'open' in col_lower:
+            elif col_lower == 'open':
                 col_map[col] = 'open'
-            elif 'high' in col_lower:
+            elif col_lower == 'high':
                 col_map[col] = 'high'
-            elif 'low' in col_lower:
+            elif col_lower == 'low':
                 col_map[col] = 'low'
-            elif 'close' in col_lower or 'clo' in col_lower:
+            elif col_lower == 'close' or 'close' in col_lower:
                 col_map[col] = 'close'
-            elif 'volume' in col_lower or 'vol' in col_lower:
+            elif 'prevclo' in col_lower or 'prevclose' in col_lower:
+                col_map[col] = 'prev_close'
+            elif 'volume' in col_lower or col_lower == 'volume':
                 col_map[col] = 'volume'
+            elif 'vwap' in col_lower:
+                col_map[col] = 'vwap'
         
         # Rename columns
         if col_map:
             df.rename(columns=col_map, inplace=True)
         
-        # Check required columns
-        required_cols = ['date', 'open', 'high', 'low', 'close']
-        missing_cols = [col for col in required_cols if col not in df.columns]
+        # Check if we have required columns
+        if 'date' not in df.columns:
+            st.error(f"'Date' column not found. Available columns: {list(df.columns)}")
+            return pd.DataFrame()
         
-        if missing_cols:
-            st.error(f"Missing required columns: {missing_cols}. Available columns: {list(df.columns)}")
+        # Remove rows with invalid dates (like ########)
+        df = df[~df['date'].astype(str).str.contains('#', na=False)]
+        df = df[df['date'].notna()]
+        
+        if df.empty:
+            st.error("No valid data rows found after removing invalid dates")
             return pd.DataFrame()
         
         # Parse date column - try multiple formats
-        if 'date' in df.columns:
-            try:
-                df['date'] = pd.to_datetime(df['date'], errors='coerce')
-            except:
-                # Try alternative date parsing
-                df['date'] = pd.to_datetime(df['date'], format='mixed', errors='coerce')
+        try:
+            df['date'] = pd.to_datetime(df['date'], errors='coerce', dayfirst=True)
+        except Exception as e:
+            st.error(f"Date parsing error: {str(e)}")
+            return pd.DataFrame()
         
-        # Remove rows with invalid dates
+        # Remove rows with invalid dates after parsing
         df = df[df['date'].notna()]
         
         if df.empty:
@@ -273,21 +281,41 @@ def parse_uploaded_csv(uploaded_file) -> pd.DataFrame:
         df.set_index('date', inplace=True)
         df.sort_index(inplace=True)
         
+        # Required columns for analysis
+        required_cols = ['open', 'high', 'low', 'close']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        
+        if missing_cols:
+            st.error(f"Missing required columns: {missing_cols}. Available columns: {list(df.columns)}")
+            return pd.DataFrame()
+        
         # Convert numeric columns
         numeric_cols = ['open', 'high', 'low', 'close']
         if 'volume' in df.columns:
             numeric_cols.append('volume')
+        if 'prev_close' in df.columns:
+            numeric_cols.append('prev_close')
+        if 'vwap' in df.columns:
+            numeric_cols.append('vwap')
         
         for col in numeric_cols:
             if col in df.columns:
-                # Remove commas and convert to numeric
                 try:
-                    if df[col].dtype == 'object' or df[col].dtype == 'string':
-                        df[col] = df[col].astype(str).str.replace(',', '').str.strip()
+                    # Convert to string first and clean
+                    df[col] = df[col].astype(str)
+                    # Remove commas
+                    df[col] = df[col].str.replace(',', '', regex=False)
+                    # Remove any whitespace
+                    df[col] = df[col].str.strip()
+                    # Convert to numeric
                     df[col] = pd.to_numeric(df[col], errors='coerce')
                 except Exception as e:
-                    # If conversion fails, try direct numeric conversion
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                    st.warning(f"Could not convert column '{col}': {str(e)}")
+                    # Try direct numeric conversion as fallback
+                    try:
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                    except:
+                        pass
         
         # Drop rows with missing close values
         df = df[df['close'].notna()]
@@ -300,10 +328,16 @@ def parse_uploaded_csv(uploaded_file) -> pd.DataFrame:
         if 'volume' not in df.columns:
             df['volume'] = 0
         
+        # Keep only required columns for processing
+        available_cols = [col for col in ['open', 'high', 'low', 'close', 'volume'] if col in df.columns]
+        df = df[available_cols]
+        
         return df
         
     except Exception as e:
+        import traceback
         st.error(f"Error parsing CSV: {str(e)}")
+        st.error(f"Traceback: {traceback.format_exc()}")
         return pd.DataFrame()
 
 
