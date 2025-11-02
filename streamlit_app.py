@@ -616,4 +616,4 @@ def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str |
 def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
     st.header("2. Price Predictor with Reinforcement Learning")
     if not kite_client:
-        st.info("Login first
+        st.info("Login first)
