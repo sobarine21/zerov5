@@ -281,9 +281,13 @@ def parse_uploaded_csv(uploaded_file) -> pd.DataFrame:
         for col in numeric_cols:
             if col in df.columns:
                 # Remove commas and convert to numeric
-                if df[col].dtype == 'object':
-                    df[col] = df[col].astype(str).str.replace(',', '').str.strip()
-                df[col] = pd.to_numeric(df[col], errors='coerce')
+                try:
+                    if df[col].dtype == 'object' or df[col].dtype == 'string':
+                        df[col] = df[col].astype(str).str.replace(',', '').str.strip()
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                except Exception as e:
+                    # If conversion fails, try direct numeric conversion
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
         
         # Drop rows with missing close values
         df = df[df['close'].notna()]
