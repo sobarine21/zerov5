@@ -225,30 +225,44 @@ def parse_uploaded_csv(uploaded_file) -> pd.DataFrame:
         # Strip whitespace from column names
         df.columns = df.columns.str.strip()
         
-        # Create column mapping (case-insensitive)
+        # Create column mapping (case-insensitive) - use FIRST occurrence only
         col_map = {}
+        mapped_targets = set()  # Track which target names we've already mapped
+        
         for col in df.columns:
             col_lower = col.lower().replace(' ', '').replace('.', '')
-            if 'date' in col_lower:
-                col_map[col] = 'date'
-            elif col_lower == 'open':
-                col_map[col] = 'open'
-            elif col_lower == 'high':
-                col_map[col] = 'high'
-            elif col_lower == 'low':
-                col_map[col] = 'low'
-            elif col_lower == 'close' or 'close' in col_lower:
-                col_map[col] = 'close'
-            elif 'prevclo' in col_lower or 'prevclose' in col_lower:
-                col_map[col] = 'prev_close'
-            elif 'volume' in col_lower or col_lower == 'volume':
-                col_map[col] = 'volume'
-            elif 'vwap' in col_lower:
-                col_map[col] = 'vwap'
+            target_name = None
+            
+            if 'date' in col_lower and 'date' not in mapped_targets:
+                target_name = 'date'
+            elif col_lower == 'open' and 'open' not in mapped_targets:
+                target_name = 'open'
+            elif col_lower == 'high' and 'high' not in mapped_targets:
+                target_name = 'high'
+            elif col_lower == 'low' and 'low' not in mapped_targets:
+                target_name = 'low'
+            elif 'close' in col_lower and 'close' not in mapped_targets:
+                # Prefer exact 'close' over 'prev close'
+                if col_lower == 'close':
+                    target_name = 'close'
+                elif 'prev' not in col_lower and 'close' not in mapped_targets:
+                    target_name = 'close'
+            elif ('prevclo' in col_lower or 'prevclose' in col_lower) and 'prev_close' not in mapped_targets:
+                target_name = 'prev_close'
+            elif 'volume' in col_lower and 'volume' not in mapped_targets:
+                target_name = 'volume'
+            elif 'vwap' in col_lower and 'vwap' not in mapped_targets:
+                target_name = 'vwap'
+            
+            if target_name:
+                col_map[col] = target_name
+                mapped_targets.add(target_name)
         
-        # Rename columns
-        if col_map:
-            df.rename(columns=col_map, inplace=True)
+        # Rename only the mapped columns
+        df.rename(columns=col_map, inplace=True)
+        
+        # Drop duplicate columns if any exist after renaming
+        df = df.loc[:, ~df.columns.duplicated()]
         
         # Check if we have required columns
         if 'date' not in df.columns:
@@ -267,8 +281,11 @@ def parse_uploaded_csv(uploaded_file) -> pd.DataFrame:
         try:
             df['date'] = pd.to_datetime(df['date'], errors='coerce', dayfirst=True)
         except Exception as e:
-            st.error(f"Date parsing error: {str(e)}")
-            return pd.DataFrame()
+            try:
+                df['date'] = pd.to_datetime(df['date'], errors='coerce')
+            except:
+                st.error(f"Date parsing error: {str(e)}")
+                return pd.DataFrame()
         
         # Remove rows with invalid dates after parsing
         df = df[df['date'].notna()]
@@ -318,11 +335,15 @@ def parse_uploaded_csv(uploaded_file) -> pd.DataFrame:
                         pass
         
         # Drop rows with missing close values
-        df = df[df['close'].notna()]
+        initial_len = len(df)
+        df = df.dropna(subset=['close'])
         
         if df.empty:
             st.error("No valid price data found after parsing")
             return pd.DataFrame()
+        
+        if len(df) < initial_len:
+            st.info(f"Removed {initial_len - len(df)} rows with missing close prices")
         
         # Add volume column if missing
         if 'volume' not in df.columns:
