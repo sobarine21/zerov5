@@ -16,6 +16,7 @@ import lightgbm as lgb
 import ta  # Technical Analysis library
 from sklearn.preprocessing import MinMaxScaler 
 import pickle
+import io
 
 # Supabase imports
 from supabase import create_client, Client
@@ -23,7 +24,7 @@ from supabase import create_client, Client
 # --- Streamlit Page Configuration ---
 st.set_page_config(page_title="Invsion Connect - Algorithmic Trading Platform", layout="wide", initial_sidebar_state="expanded")
 st.title("Invsion Connect - Algorithmic Trading & Price Prediction Platform with RL")
-st.markdown("A focused platform with **Reinforcement Learning** that learns from prediction errors and adapts over time.")
+st.markdown("A focused platform with **Reinforcement Learning** that learns from actual market data and adapts predictions.")
 
 # --- Global Constants & Session State Initialization ---
 TRADING_DAYS_PER_YEAR = 252
@@ -66,6 +67,10 @@ if "rl_learning_rate" not in st.session_state:
     st.session_state["rl_learning_rate"] = 0.01
 if "rl_enabled" not in st.session_state:
     st.session_state["rl_enabled"] = True
+if "uploaded_real_data" not in st.session_state:
+    st.session_state["uploaded_real_data"] = pd.DataFrame()
+if "rl_training_complete" not in st.session_state:
+    st.session_state["rl_training_complete"] = False
 
 # --- Load Credentials from Streamlit Secrets ---
 def load_secrets():
@@ -210,6 +215,69 @@ def add_advanced_features(df: pd.DataFrame) -> pd.DataFrame:
     return df_copy
 
 
+# --- CSV PARSING FUNCTION ---
+def parse_uploaded_csv(uploaded_file) -> pd.DataFrame:
+    """Parse uploaded CSV file with flexible column mapping"""
+    try:
+        # Read CSV
+        df = pd.read_csv(uploaded_file)
+        
+        # Strip whitespace from column names
+        df.columns = df.columns.str.strip()
+        
+        # Create column mapping (case-insensitive)
+        col_map = {}
+        for col in df.columns:
+            col_lower = col.lower()
+            if 'date' in col_lower:
+                col_map[col] = 'date'
+            elif 'open' in col_lower:
+                col_map[col] = 'open'
+            elif 'high' in col_lower:
+                col_map[col] = 'high'
+            elif 'low' in col_lower:
+                col_map[col] = 'low'
+            elif 'close' in col_lower:
+                col_map[col] = 'close'
+            elif 'volume' in col_lower:
+                col_map[col] = 'volume'
+        
+        # Rename columns
+        df.rename(columns=col_map, inplace=True)
+        
+        # Check required columns
+        required_cols = ['date', 'open', 'high', 'low', 'close']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        
+        if missing_cols:
+            st.error(f"Missing required columns: {missing_cols}")
+            return pd.DataFrame()
+        
+        # Parse date column
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        
+        # Set date as index
+        df.set_index('date', inplace=True)
+        df.sort_index(inplace=True)
+        
+        # Convert numeric columns
+        numeric_cols = ['open', 'high', 'low', 'close']
+        if 'volume' in df.columns:
+            numeric_cols.append('volume')
+        
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # Drop rows with missing values
+        df.dropna(subset=['close'], inplace=True)
+        
+        return df
+        
+    except Exception as e:
+        st.error(f"Error parsing CSV: {e}")
+        return pd.DataFrame()
+
+
 # --- REINFORCEMENT LEARNING FUNCTIONS ---
 
 class AdaptivePredictionCorrector:
@@ -221,6 +289,7 @@ class AdaptivePredictionCorrector:
         self.weights = np.zeros(n_features + 1)  # +1 for bias
         self.learning_rate = learning_rate
         self.error_history = []
+        self.n_updates = 0
         
     def predict_correction(self, features, base_prediction):
         """Predict correction factor to apply to base model prediction"""
@@ -237,6 +306,7 @@ class AdaptivePredictionCorrector:
         # Gradient descent update
         gradient = error * X
         self.weights += self.learning_rate * gradient
+        self.n_updates += 1
         
         return error
 
@@ -258,48 +328,85 @@ def store_prediction_feedback(features, predicted, actual, symbol, timestamp):
     
     st.session_state["rl_memory"].append(feedback_entry)
     
-    # Keep only last 500 entries to prevent memory overflow
-    if len(st.session_state["rl_memory"]) > 500:
-        st.session_state["rl_memory"] = st.session_state["rl_memory"][-500:]
+    # Keep only last 1000 entries to prevent memory overflow
+    if len(st.session_state["rl_memory"]) > 1000:
+        st.session_state["rl_memory"] = st.session_state["rl_memory"][-1000:]
     
     return feedback_entry
 
 
-def train_rl_correction_model():
-    """Train the RL correction model on accumulated feedback"""
-    memory = st.session_state["rl_memory"]
+def train_rl_on_real_data(model, scaler, features_list, real_data_df, horizon, symbol):
+    """
+    Train RL model on real historical data by making predictions and learning from actual outcomes.
+    This simulates forward-testing where we predict and then see the actual result.
+    """
+    if real_data_df.empty or model is None:
+        return 0
     
-    if len(memory) < 10:  # Need minimum data
-        return None
+    # Add features to real data
+    real_data_with_features = add_advanced_features(real_data_df)
     
-    # Extract training data from memory
-    X_train = []
-    y_train = []
+    if real_data_with_features.empty:
+        return 0
     
-    for entry in memory:
-        features = entry['features']
-        error = entry['error']
-        X_train.append(features)
-        y_train.append(error)
+    predictions_made = 0
     
-    X_train = np.array(X_train)
-    y_train = np.array(y_train)
-    
-    # Initialize or update correction model
+    # Initialize RL model if not exists
     if st.session_state["rl_correction_model"] is None:
-        n_features = X_train.shape[1]
+        n_features = len(features_list)
         st.session_state["rl_correction_model"] = AdaptivePredictionCorrector(
             n_features, 
             learning_rate=st.session_state["rl_learning_rate"]
         )
     
-    # Train on recent errors
     corrector = st.session_state["rl_correction_model"]
-    for features, error_val in zip(X_train[-50:], y_train[-50:]):  # Use last 50 samples
-        # Simulate update (in real scenario, this happens when actual data arrives)
-        pass
     
-    return corrector
+    # Iterate through the data, making predictions and learning
+    for i in range(len(real_data_with_features) - horizon):
+        try:
+            # Get current features
+            current_features = real_data_with_features[features_list].iloc[[i]]
+            
+            # Scale features
+            current_features_scaled = scaler.transform(current_features)
+            
+            # Make base prediction
+            base_prediction = model.predict(current_features_scaled)[0]
+            
+            # Apply RL correction if available
+            if corrector.n_updates > 0:
+                corrected_prediction = corrector.predict_correction(
+                    current_features_scaled[0], 
+                    base_prediction
+                )
+            else:
+                corrected_prediction = base_prediction
+            
+            # Get actual price after horizon periods
+            actual_price = real_data_with_features['close'].iloc[i + horizon]
+            
+            # Store feedback
+            store_prediction_feedback(
+                features=current_features_scaled[0],
+                predicted=corrected_prediction,
+                actual=actual_price,
+                symbol=symbol,
+                timestamp=real_data_with_features.index[i]
+            )
+            
+            # Update RL model with this error
+            corrector.update(
+                current_features_scaled[0],
+                corrected_prediction,
+                actual_price
+            )
+            
+            predictions_made += 1
+            
+        except Exception as e:
+            continue
+    
+    return predictions_made
 
 
 def apply_rl_correction(base_prediction, features):
@@ -308,7 +415,7 @@ def apply_rl_correction(base_prediction, features):
         return base_prediction
     
     corrector = st.session_state["rl_correction_model"]
-    if corrector is None:
+    if corrector is None or corrector.n_updates == 0:
         return base_prediction
     
     corrected_prediction = corrector.predict_correction(features, base_prediction)
@@ -376,6 +483,7 @@ with st.sidebar:
     if st.button("Reset RL Memory", key="reset_rl_btn"):
         st.session_state["rl_memory"] = []
         st.session_state["rl_correction_model"] = None
+        st.session_state["rl_training_complete"] = False
         st.success("RL memory reset!")
         st.rerun()
     
@@ -385,8 +493,12 @@ with st.sidebar:
         st.markdown("##### RL Performance")
         st.metric("Total Predictions Tracked", rl_metrics['total_predictions'])
         st.metric("Recent Avg Error %", f"{rl_metrics['avg_recent_error']:.2f}%")
-        st.metric("Learning Improvement", f"{rl_metrics['improvement']:.2f}%", 
-                 delta=f"{rl_metrics['improvement']:.2f}%" if rl_metrics['improvement'] > 0 else None)
+        improvement_val = rl_metrics['improvement']
+        st.metric("Learning Improvement", f"{improvement_val:.2f}%", 
+                 delta=f"{improvement_val:.2f}%" if improvement_val > 0 else None)
+        
+        if st.session_state["rl_training_complete"]:
+            st.success("✅ RL Training Complete on Real Data")
 
     st.markdown("---")
     st.markdown("### 3. Supabase User Account (Optional)")
@@ -461,7 +573,10 @@ def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str |
         hist_exchange = st.selectbox("Exchange", ["NSE", "BSE", "NFO"], key="hist_ex_tab_selector")
         hist_symbol = st.text_input("Tradingsymbol", value="INFY", key="hist_sym_tab_input") 
         from_date = st.date_input("From Date", value=datetime.now().date() - timedelta(days=365), key="from_dt_tab_input")
-        to_date = st.date_input("To Date", value=datetime.now().date(), key="to_dt_tab_input")
+        to_date = st.date_input("To Date", value=datetime.now().date() - timedelta(days=30), key="to_dt_tab_input")
+        
+        st.info("💡 Set 'To Date' to 1 month before today to leave room for RL training with real data")
+        
         interval = st.selectbox("Interval", ["day", "minute", "5minute", "30minute", "week", "month"], index=0, key="hist_interval_selector")
 
         if st.button("Fetch Historical Data", key="fetch_historical_data_btn"):
@@ -481,6 +596,7 @@ def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str |
                     st.session_state["last_fetched_symbol"] = hist_symbol
                     st.session_state["ml_data"] = pd.DataFrame()
                     st.session_state["ml_model"] = None
+                    st.session_state["rl_training_complete"] = False
                     st.success(f"Fetched {len(df_hist)} records for {hist_symbol}.")
                 else:
                     st.error(f"Historical fetch failed: {df_hist.get('_error', 'Unknown error')}")
@@ -500,336 +616,4 @@ def render_market_historical_tab(kite_client: KiteConnect | None, api_key: str |
 def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | None, access_token: str | None):
     st.header("2. Price Predictor with Reinforcement Learning")
     if not kite_client:
-        st.info("Login first to perform ML analysis.")
-        return
-
-    historical_data = st.session_state.get("historical_data", pd.DataFrame())
-    last_symbol = st.session_state.get("last_fetched_symbol", "N/A")
-
-    if historical_data.empty:
-        st.warning("No historical data. Fetch from 'Market Data & Historical Data' first.")
-        return
-
-    st.subheader(f"1. Feature Engineering & Data Preparation for {last_symbol}")
-    
-    col_feat_eng, col_prep = st.columns(2)
-    with col_feat_eng:
-        if st.button("Generate Advanced Features (Indicators & Lags)", key="generate_features_btn"):
-            df_with_features = add_advanced_features(historical_data)
-            if not df_with_features.empty:
-                st.session_state["ml_data"] = df_with_features
-                st.session_state["ml_model"] = None
-                st.success(f"Data prepared with {len(df_with_features.columns)} features.")
-            else:
-                st.error("Failed to add features. Data might be too short or invalid.")
-                st.session_state["ml_data"] = pd.DataFrame()
-
-    ml_data = st.session_state.get("ml_data", pd.DataFrame())
-    
-    if not ml_data.empty:
-        
-        with col_prep:
-            current_prediction_horizon = st.number_input("Prediction Horizon (Periods/Days Ahead)", min_value=1, max_value=20, value=5, step=1, key="pred_horizon")
-            test_size = st.slider("Test Set Size (%)", 10, 50, 20, step=5) / 100.0
-        
-        st.markdown("---")
-        st.subheader("2. Machine Learning Model Training with RL Enhancement")
-        
-        col_ml_controls, col_ml_output = st.columns(2)
-        
-        ml_data_processed = ml_data.copy()
-        ml_data_processed['target'] = ml_data_processed['close'].shift(-current_prediction_horizon)
-        ml_data_processed.dropna(subset=['target'], inplace=True)
-        
-        features = [col for col in ml_data_processed.columns if col not in ['open', 'high', 'low', 'close', 'volume', 'target']]
-        
-        with col_ml_controls:
-            model_type_selected = st.selectbox("Select ML Model", ["LightGBM Regressor (High Performance)", "Random Forest Regressor", "Linear Regression"], key="ml_model_type_selector")
-            selected_features = st.multiselect("Select Features for Model", options=features, default=[f for f in features if f.startswith(('RSI', 'MACD', 'Lag_Close', 'SMA', 'ATR'))], key="ml_selected_features_multiselect")
-            
-            if not selected_features:
-                st.warning("Please select at least one feature.")
-                return
-
-            X = ml_data_processed[selected_features]
-            y = ml_data_processed['target']
-            
-            if X.empty or y.empty or len(X) < 100:
-                st.error("Insufficient clean data for robust training (need at least 100 samples).")
-                return
-
-            scaler = MinMaxScaler()
-            X_scaled = scaler.fit_transform(X)
-            
-            X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=test_size, random_state=42, shuffle=False)
-            st.info(f"Training data: {len(X_train)} periods, Testing data: {len(X_test)} periods")
-
-            if st.button(f"Train {model_type_selected} Model", key="train_ml_model_btn"):
-                if len(X_train) == 0 or len(X_test) == 0:
-                    st.error("Insufficient data for training/testing.")
-                    return
-                
-                model = {
-                    "Linear Regression": LinearRegression(),
-                    "Random Forest Regressor": RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42, n_jobs=-1),
-                    "LightGBM Regressor (High Performance)": lgb.LGBMRegressor(n_estimators=300, learning_rate=0.05, num_leaves=31, random_state=42, n_jobs=-1)
-                }.get(model_type_selected)
-
-                if model:
-                    with st.spinner(f"Training {model_type_selected} model for {current_prediction_horizon}-day prediction..."):
-                        model.fit(X_train, y_train)
-                        y_pred = model.predict(X_test)
-                        
-                        # Apply RL correction to predictions if enabled
-                        if st.session_state["rl_enabled"] and st.session_state["rl_correction_model"] is not None:
-                            y_pred_corrected = []
-                            for i, pred in enumerate(y_pred):
-                                corrected = apply_rl_correction(pred, X_test[i])
-                                y_pred_corrected.append(corrected)
-                            y_pred = np.array(y_pred_corrected)
-                            st.info("✨ RL correction applied to predictions!")
-                        
-                        # Store predictions for RL learning (simulate actual prices with test set)
-                        for i in range(len(y_test)):
-                            store_prediction_feedback(
-                                features=X_test[i],
-                                predicted=y_pred[i],
-                                actual=y_test.iloc[i],
-                                symbol=last_symbol,
-                                timestamp=datetime.now()
-                            )
-                        
-                        # Train RL correction model on accumulated feedback
-                        if st.session_state["rl_enabled"] and len(st.session_state["rl_memory"]) >= 10:
-                            train_rl_correction_model()
-                            st.success("🧠 RL model updated with new feedback!")
-                    
-                    st.session_state["ml_model"] = model
-                    st.session_state["y_test"] = y_test
-                    st.session_state["y_pred"] = y_pred
-                    st.session_state["X_test_scaled"] = X_test
-                    st.session_state["scaler"] = scaler
-                    st.session_state["ml_features"] = selected_features
-                    st.session_state["ml_model_type"] = model_type_selected
-                    st.session_state["prediction_horizon"] = current_prediction_horizon
-                    st.success(f"{model_type_selected} Model Trained for {current_prediction_horizon}-day horizon!")
-        
-        with col_ml_output:
-            if st.session_state.get("ml_model") and st.session_state.get("y_test") is not None:
-                mse = mean_squared_error(st.session_state['y_test'], st.session_state['y_pred'])
-                rmse = np.sqrt(mse)
-                r2 = r2_score(st.session_state['y_test'], st.session_state['y_pred'])
-                
-                st.markdown(f"##### Evaluation Metrics ({st.session_state['prediction_horizon']} periods ahead)")
-                col_m1, col_m2 = st.columns(2)
-                col_m1.metric("RMSE", f"₹{rmse:.2f}")
-                col_m2.metric("R² Score", f"{r2:.4f}")
-                
-                # Show RL enhancement status
-                if st.session_state["rl_enabled"]:
-                    rl_metrics = calculate_rl_metrics()
-                    if rl_metrics and rl_metrics['total_predictions'] > 10:
-                        st.success(f"🤖 RL Enhanced: {rl_metrics['total_predictions']} predictions tracked, {rl_metrics['improvement']:.2f}% improvement")
-                
-                pred_df = pd.DataFrame({'Actual': st.session_state['y_test'], 'Predicted': st.session_state['y_pred']}, index=st.session_state['y_test'].index)
-                
-                fig_pred = go.Figure()
-                fig_pred.add_trace(go.Scatter(x=pred_df.index, y=pred_df['Actual'], mode='lines', name='Actual Future Price'))
-                fig_pred.add_trace(go.Scatter(x=pred_df.index, y=pred_df['Predicted'], mode='lines', name='Predicted Future Price', line=dict(dash='dot', width=2)))
-                fig_pred.update_layout(title_text=f"Model Performance: Actual vs. Predicted Price ({st.session_state['prediction_horizon']} periods ahead)", height=500, template="plotly_white")
-                st.plotly_chart(fig_pred, use_container_width=True)
-
-        st.markdown("---")
-        st.subheader(f"3. Next Prediction: Forecasting {last_symbol}")
-
-        if st.session_state.get("ml_model") and not ml_data.empty:
-            model = st.session_state["ml_model"]
-            scaler = st.session_state["scaler"]
-            features_list = st.session_state["ml_features"]
-            horizon = st.session_state["prediction_horizon"]
-            
-            latest_row = ml_data[features_list].iloc[[-1]] 
-            latest_row_scaled = scaler.transform(latest_row)
-            
-            col_forecast_btn, col_actual_update = st.columns(2)
-            
-            with col_forecast_btn:
-                if st.button(f"Generate Forecast for Next {horizon} Periods", key="generate_forecast_btn"):
-                    
-                    with st.spinner(f"Predicting next {horizon} periods..."):
-                        base_prediction = model.predict(latest_row_scaled)[0]
-                        
-                        # Apply RL correction if enabled
-                        if st.session_state["rl_enabled"] and st.session_state["rl_correction_model"] is not None:
-                            forecasted_price = apply_rl_correction(base_prediction, latest_row_scaled[0])
-                            st.info("✨ RL correction applied to forecast!")
-                        else:
-                            forecasted_price = base_prediction
-                    
-                    last_known_close = historical_data['close'].iloc[-1]
-                    predicted_change = ((forecasted_price - last_known_close) / last_known_close) * 100
-
-                    # Store this prediction
-                    st.session_state["last_forecast"] = {
-                        'timestamp': datetime.now(),
-                        'symbol': last_symbol,
-                        'predicted_price': forecasted_price,
-                        'base_price': last_known_close,
-                        'features': latest_row_scaled[0],
-                        'horizon': horizon
-                    }
-
-                    st.success(f"Forecast Generated using **{st.session_state['ml_model_type']}** model:")
-                    
-                    col_f1, col_f2, col_f3 = st.columns(3)
-                    col_f1.metric("Last Known Close", f"₹{last_known_close:.2f}")
-                    col_f2.metric(f"Predicted Price (in {horizon} periods)", 
-                                         f"₹{forecasted_price:.2f}", 
-                                         delta=f"{predicted_change:.2f}%")
-                    col_f3.metric("Forecast Date", 
-                                         (historical_data.index[-1] + timedelta(days=horizon)).strftime('%Y-%m-%d'))
-                    
-                    if predicted_change > 0:
-                        st.info(f"📈 **Action:** Potential **BUY/HOLD** signal, expecting rise of {predicted_change:.2f}%")
-                    elif predicted_change < 0:
-                        st.info(f"📉 **Action:** Potential **SELL/SHORT** signal, expecting drop of {abs(predicted_change):.2f}%")
-                    else:
-                        st.info("➡️ **Action:** Neutral outlook, minimal change predicted")
-            
-            with col_actual_update:
-                st.markdown("##### Update with Actual Price (for RL Learning)")
-                st.write("When the predicted period passes, update with actual price to improve model:")
-                
-                actual_price_input = st.number_input("Actual Price Observed", min_value=0.0, value=0.0, step=0.01, key="actual_price_input")
-                
-                if st.button("Submit Actual Price & Learn", key="submit_actual_btn"):
-                    if actual_price_input > 0 and st.session_state.get("last_forecast"):
-                        forecast = st.session_state["last_forecast"]
-                        
-                        # Store feedback for RL
-                        feedback = store_prediction_feedback(
-                            features=forecast['features'],
-                            predicted=forecast['predicted_price'],
-                            actual=actual_price_input,
-                            symbol=forecast['symbol'],
-                            timestamp=datetime.now()
-                        )
-                        
-                        # Update RL correction model
-                        if st.session_state["rl_correction_model"] is None:
-                            n_features = len(forecast['features'])
-                            st.session_state["rl_correction_model"] = AdaptivePredictionCorrector(
-                                n_features, 
-                                learning_rate=st.session_state["rl_learning_rate"]
-                            )
-                        
-                        corrector = st.session_state["rl_correction_model"]
-                        error = corrector.update(forecast['features'], forecast['predicted_price'], actual_price_input)
-                        
-                        st.success(f"✅ RL Model Updated!")
-                        st.info(f"Prediction Error: ₹{abs(error):.2f} ({abs(feedback['error_pct']):.2f}%)")
-                        
-                        # Show learning progress
-                        if len(st.session_state["rl_memory"]) > 1:
-                            rl_metrics = calculate_rl_metrics()
-                            if rl_metrics['improvement'] > 0:
-                                st.success(f"🎯 Model improving! Error reduced by {rl_metrics['improvement']:.2f}%")
-                            else:
-                                st.info(f"📊 Model learning... Track more predictions for better adaptation")
-                        
-                        st.rerun()
-                    else:
-                        st.warning("Please enter a valid actual price and ensure a forecast was generated.")
-        else:
-            st.info("Train the machine learning model first to generate forecasts.")
-
-        # Display RL Learning History
-        if st.session_state["rl_memory"]:
-            st.markdown("---")
-            st.subheader("4. RL Learning History & Performance")
-            
-            col_rl1, col_rl2 = st.columns([2, 1])
-            
-            with col_rl1:
-                # Plot error progression over time
-                memory_df = pd.DataFrame([
-                    {
-                        'timestamp': entry['timestamp'],
-                        'error_pct': abs(entry['error_pct']),
-                        'symbol': entry['symbol']
-                    }
-                    for entry in st.session_state["rl_memory"]
-                ])
-                
-                fig_rl = go.Figure()
-                fig_rl.add_trace(go.Scatter(
-                    x=memory_df.index, 
-                    y=memory_df['error_pct'],
-                    mode='lines+markers',
-                    name='Prediction Error %',
-                    line=dict(color='red', width=2)
-                ))
-                
-                # Add trend line
-                if len(memory_df) > 5:
-                    z = np.polyfit(memory_df.index, memory_df['error_pct'], 1)
-                    p = np.poly1d(z)
-                    fig_rl.add_trace(go.Scatter(
-                        x=memory_df.index,
-                        y=p(memory_df.index),
-                        mode='lines',
-                        name='Trend',
-                        line=dict(color='green', dash='dash', width=2)
-                    ))
-                
-                fig_rl.update_layout(
-                    title_text="RL Learning Progress: Prediction Error Over Time",
-                    xaxis_title="Prediction Number",
-                    yaxis_title="Absolute Error %",
-                    height=400,
-                    template="plotly_white"
-                )
-                st.plotly_chart(fig_rl, use_container_width=True)
-            
-            with col_rl2:
-                rl_metrics = calculate_rl_metrics()
-                if rl_metrics:
-                    st.markdown("##### RL Statistics")
-                    st.metric("Total Predictions", rl_metrics['total_predictions'])
-                    st.metric("Best Prediction Error", f"{rl_metrics['best_prediction_error']:.2f}%")
-                    st.metric("Recent Avg Error", f"{rl_metrics['avg_recent_error']:.2f}%")
-                    st.metric("Learning Improvement", 
-                             f"{rl_metrics['improvement']:.2f}%",
-                             delta=f"{rl_metrics['improvement']:.2f}%")
-            
-            # Show recent predictions table
-            st.markdown("##### Recent Predictions Log")
-            recent_predictions = st.session_state["rl_memory"][-10:][::-1]  # Last 10, reversed
-            
-            log_df = pd.DataFrame([
-                {
-                    'Time': entry['timestamp'].strftime('%Y-%m-%d %H:%M'),
-                    'Symbol': entry['symbol'],
-                    'Predicted': f"₹{entry['predicted']:.2f}",
-                    'Actual': f"₹{entry['actual']:.2f}",
-                    'Error': f"₹{entry['error']:.2f}",
-                    'Error %': f"{entry['error_pct']:.2f}%"
-                }
-                for entry in recent_predictions
-            ])
-            
-            st.dataframe(log_df, use_container_width=True, hide_index=True)
-
-
-# --- Main Application Logic ---
-api_key = KITE_CREDENTIALS["api_key"]
-access_token = st.session_state["kite_access_token"]
-
-tabs = st.tabs(["Market Data & Historical Data", "Price Predictor (ML + RL)"])
-tab_market, tab_ml = tabs
-
-with tab_market: 
-    render_market_historical_tab(k, api_key, access_token)
-    
-with tab_ml: 
-    render_price_predictor_tab(k, api_key, access_token)
+        st.info("Login first
