@@ -425,72 +425,129 @@ def train_rl_on_real_data(model, scaler, features_list, real_data_df, horizon, s
     This simulates forward-testing where we predict and then see the actual result.
     """
     if real_data_df.empty or model is None:
+        st.error("Empty data or no model provided")
         return 0
     
-    # Add features to real data
-    real_data_with_features = add_advanced_features(real_data_df)
-    
-    if real_data_with_features.empty:
-        return 0
-    
-    predictions_made = 0
-    
-    # Initialize RL model if not exists
-    if st.session_state["rl_correction_model"] is None:
-        n_features = len(features_list)
-        st.session_state["rl_correction_model"] = AdaptivePredictionCorrector(
-            n_features, 
-            learning_rate=st.session_state["rl_learning_rate"]
-        )
-    
-    corrector = st.session_state["rl_correction_model"]
-    
-    # Iterate through the data, making predictions and learning
-    for i in range(len(real_data_with_features) - horizon):
-        try:
-            # Get current features
-            current_features = real_data_with_features[features_list].iloc[[i]]
-            
-            # Scale features
-            current_features_scaled = scaler.transform(current_features)
-            
-            # Make base prediction
-            base_prediction = model.predict(current_features_scaled)[0]
-            
-            # Apply RL correction if available
-            if corrector.n_updates > 0:
-                corrected_prediction = corrector.predict_correction(
-                    current_features_scaled[0], 
-                    base_prediction
+    try:
+        # Add features to real data
+        st.info(f"Processing {len(real_data_df)} rows of real data...")
+        real_data_with_features = add_advanced_features(real_data_df)
+        
+        if real_data_with_features.empty:
+            st.error("Feature generation failed on real data")
+            return 0
+        
+        st.info(f"Generated features, {len(real_data_with_features)} rows available after feature engineering")
+        
+        # Check if we have the required features
+        missing_features = [f for f in features_list if f not in real_data_with_features.columns]
+        if missing_features:
+            st.error(f"Missing features in real data: {missing_features}")
+            st.info(f"Available features: {list(real_data_with_features.columns)}")
+            return 0
+        
+        predictions_made = 0
+        errors_list = []
+        
+        # Initialize RL model if not exists
+        if st.session_state["rl_correction_model"] is None:
+            n_features = len(features_list)
+            st.session_state["rl_correction_model"] = AdaptivePredictionCorrector(
+                n_features, 
+                learning_rate=st.session_state["rl_learning_rate"]
+            )
+        
+        corrector = st.session_state["rl_correction_model"]
+        
+        # Calculate how many predictions we can make
+        max_predictions = len(real_data_with_features) - horizon
+        st.info(f"Can make {max_predictions} predictions with horizon of {horizon}")
+        
+        if max_predictions <= 0:
+            st.error(f"Not enough data. Need at least {horizon + 1} rows, but have {len(real_data_with_features)}")
+            return 0
+        
+        # Create progress bar
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        # Iterate through the data, making predictions and learning
+        for i in range(max_predictions):
+            try:
+                # Update progress
+                progress = (i + 1) / max_predictions
+                progress_bar.progress(progress)
+                status_text.text(f"Processing prediction {i+1}/{max_predictions}...")
+                
+                # Get current features
+                current_features = real_data_with_features[features_list].iloc[[i]]
+                
+                # Check for NaN values in features
+                if current_features.isnull().any().any():
+                    continue
+                
+                # Scale features
+                current_features_scaled = scaler.transform(current_features)
+                
+                # Make base prediction
+                base_prediction = model.predict(current_features_scaled)[0]
+                
+                # Apply RL correction if available
+                if corrector.n_updates > 0:
+                    corrected_prediction = corrector.predict_correction(
+                        current_features_scaled[0], 
+                        base_prediction
+                    )
+                else:
+                    corrected_prediction = base_prediction
+                
+                # Get actual price after horizon periods
+                actual_price = real_data_with_features['close'].iloc[i + horizon]
+                
+                # Skip if actual price is NaN
+                if pd.isna(actual_price):
+                    continue
+                
+                # Store feedback
+                store_prediction_feedback(
+                    features=current_features_scaled[0],
+                    predicted=corrected_prediction,
+                    actual=actual_price,
+                    symbol=symbol,
+                    timestamp=real_data_with_features.index[i]
                 )
-            else:
-                corrected_prediction = base_prediction
-            
-            # Get actual price after horizon periods
-            actual_price = real_data_with_features['close'].iloc[i + horizon]
-            
-            # Store feedback
-            store_prediction_feedback(
-                features=current_features_scaled[0],
-                predicted=corrected_prediction,
-                actual=actual_price,
-                symbol=symbol,
-                timestamp=real_data_with_features.index[i]
-            )
-            
-            # Update RL model with this error
-            corrector.update(
-                current_features_scaled[0],
-                corrected_prediction,
-                actual_price
-            )
-            
-            predictions_made += 1
-            
-        except Exception as e:
-            continue
-    
-    return predictions_made
+                
+                # Update RL model with this error
+                error = corrector.update(
+                    current_features_scaled[0],
+                    corrected_prediction,
+                    actual_price
+                )
+                
+                errors_list.append(abs(error))
+                predictions_made += 1
+                
+            except Exception as e:
+                st.warning(f"Error at iteration {i}: {str(e)}")
+                continue
+        
+        # Clear progress indicators
+        progress_bar.empty()
+        status_text.empty()
+        
+        # Show summary statistics
+        if predictions_made > 0 and errors_list:
+            avg_error = np.mean(errors_list)
+            st.success(f"✅ Training complete! Made {predictions_made} predictions")
+            st.info(f"Average error: ₹{avg_error:.2f}")
+        
+        return predictions_made
+        
+    except Exception as e:
+        import traceback
+        st.error(f"Error in RL training: {str(e)}")
+        st.error(f"Traceback: {traceback.format_exc()}")
+        return 0
 
 
 def apply_rl_correction(base_prediction, features):
@@ -856,35 +913,46 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
                 features_list = st.session_state["ml_features"]
                 horizon = st.session_state["prediction_horizon"]
                 
-                st.write(f"Model ready: ✅")
-                st.write(f"Real data loaded: ✅ ({len(real_data)} points)")
-                st.write(f"Prediction horizon: {horizon} periods")
+                st.write(f"✅ Model ready: {st.session_state['ml_model_type']}")
+                st.write(f"✅ Real data loaded: {len(real_data)} rows")
+                st.write(f"✅ Prediction horizon: {horizon} periods")
+                st.write(f"✅ Features count: {len(features_list)}")
+                
+                # Show date range of uploaded data
+                if not real_data.empty:
+                    st.info(f"Data range: {real_data.index.min().strftime('%Y-%m-%d')} to {real_data.index.max().strftime('%Y-%m-%d')}")
                 
                 if st.button("🚀 Train RL on Real Data", key="train_rl_real_data_btn"):
-                    with st.spinner("Training RL model on real market movements..."):
-                        predictions_made = train_rl_on_real_data(
-                            model=model,
-                            scaler=scaler,
-                            features_list=features_list,
-                            real_data_df=real_data,
-                            horizon=horizon,
-                            symbol=last_symbol
-                        )
+                    predictions_made = train_rl_on_real_data(
+                        model=model,
+                        scaler=scaler,
+                        features_list=features_list,
+                        real_data_df=real_data,
+                        horizon=horizon,
+                        symbol=last_symbol
+                    )
+                    
+                    if predictions_made > 0:
+                        st.session_state["rl_training_complete"] = True
+                        st.success(f"🎉 RL Training Complete! Made {predictions_made} predictions and learned from actual outcomes.")
                         
-                        if predictions_made > 0:
-                            st.session_state["rl_training_complete"] = True
-                            st.success(f"🎉 RL Training Complete! Made {predictions_made} predictions and learned from actual outcomes.")
+                        # Show improvement metrics
+                        rl_metrics = calculate_rl_metrics()
+                        if rl_metrics:
+                            col_rl1, col_rl2 = st.columns(2)
+                            col_rl1.metric("Predictions Made", predictions_made)
+                            col_rl2.metric("Avg Recent Error", f"{rl_metrics['avg_recent_error']:.2f}%")
                             
-                            # Show improvement metrics
-                            rl_metrics = calculate_rl_metrics()
-                            if rl_metrics:
-                                col_rl1, col_rl2 = st.columns(2)
-                                col_rl1.metric("Predictions Made", predictions_made)
-                                col_rl2.metric("Avg Error", f"{rl_metrics['avg_recent_error']:.2f}%")
-                            
-                            st.rerun()
-                        else:
-                            st.error("No predictions could be made. Check data compatibility.")
+                            if rl_metrics['improvement'] > 0:
+                                st.success(f"📈 Model improved by {rl_metrics['improvement']:.2f}%!")
+                        
+                        st.rerun()
+                    else:
+                        st.error("❌ No predictions could be made. Possible reasons:")
+                        st.write("- Uploaded data may be too short (need at least horizon + feature calculation period)")
+                        st.write("- Date format might not match")
+                        st.write("- Missing required price columns")
+                        st.write("- Feature generation might have failed")
             else:
                 if not st.session_state.get("ml_model"):
                     st.warning("⚠️ Train the ML model first")
