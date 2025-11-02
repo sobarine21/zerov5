@@ -237,24 +237,37 @@ def parse_uploaded_csv(uploaded_file) -> pd.DataFrame:
                 col_map[col] = 'high'
             elif 'low' in col_lower:
                 col_map[col] = 'low'
-            elif 'close' in col_lower:
+            elif 'close' in col_lower or 'clo' in col_lower:
                 col_map[col] = 'close'
-            elif 'volume' in col_lower:
+            elif 'volume' in col_lower or 'vol' in col_lower:
                 col_map[col] = 'volume'
         
         # Rename columns
-        df.rename(columns=col_map, inplace=True)
+        if col_map:
+            df.rename(columns=col_map, inplace=True)
         
         # Check required columns
         required_cols = ['date', 'open', 'high', 'low', 'close']
         missing_cols = [col for col in required_cols if col not in df.columns]
         
         if missing_cols:
-            st.error(f"Missing required columns: {missing_cols}")
+            st.error(f"Missing required columns: {missing_cols}. Available columns: {list(df.columns)}")
             return pd.DataFrame()
         
-        # Parse date column
-        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        # Parse date column - try multiple formats
+        if 'date' in df.columns:
+            try:
+                df['date'] = pd.to_datetime(df['date'], errors='coerce')
+            except:
+                # Try alternative date parsing
+                df['date'] = pd.to_datetime(df['date'], format='mixed', errors='coerce')
+        
+        # Remove rows with invalid dates
+        df = df[df['date'].notna()]
+        
+        if df.empty:
+            st.error("No valid dates found in the CSV file")
+            return pd.DataFrame()
         
         # Set date as index
         df.set_index('date', inplace=True)
@@ -266,15 +279,27 @@ def parse_uploaded_csv(uploaded_file) -> pd.DataFrame:
             numeric_cols.append('volume')
         
         for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+            if col in df.columns:
+                # Remove commas and convert to numeric
+                if df[col].dtype == 'object':
+                    df[col] = df[col].astype(str).str.replace(',', '').str.strip()
+                df[col] = pd.to_numeric(df[col], errors='coerce')
         
-        # Drop rows with missing values
-        df.dropna(subset=['close'], inplace=True)
+        # Drop rows with missing close values
+        df = df[df['close'].notna()]
+        
+        if df.empty:
+            st.error("No valid price data found after parsing")
+            return pd.DataFrame()
+        
+        # Add volume column if missing
+        if 'volume' not in df.columns:
+            df['volume'] = 0
         
         return df
         
     except Exception as e:
-        st.error(f"Error parsing CSV: {e}")
+        st.error(f"Error parsing CSV: {str(e)}")
         return pd.DataFrame()
 
 
@@ -861,33 +886,35 @@ def render_price_predictor_tab(kite_client: KiteConnect | None, api_key: str | N
             with col_forecast_display:
                 if st.session_state.get("last_forecast"):
                     forecast = st.session_state["last_forecast"]
-                    last_known_close = forecast['base_price']
-                    forecasted_price = forecast['predicted_price']
-                    predicted_change = ((forecasted_price - last_known_close) / last_known_close) * 100
+                    last_known_close = forecast.get('base_price', 0)
+                    forecasted_price = forecast.get('predicted_price', 0)
                     
-                    col_f1, col_f2, col_f3 = st.columns(3)
-                    col_f1.metric("Last Known Close", f"₹{last_known_close:.2f}")
-                    col_f2.metric(f"Predicted Price ({forecast['horizon']} periods)", 
-                                         f"₹{forecasted_price:.2f}", 
-                                         delta=f"{predicted_change:.2f}%")
-                    col_f3.metric("Forecast Date", 
-                                         (historical_data.index[-1] + timedelta(days=forecast['horizon'])).strftime('%Y-%m-%d'))
-                    
-                    if forecast['rl_applied']:
-                        base_pred = forecast['base_prediction']
-                        rl_correction = forecasted_price - base_pred
-                        st.info(f"🤖 RL Correction Applied: ₹{rl_correction:+.2f} from base prediction")
-                    
-                    if predicted_change > 2:
-                        st.success(f"📈 **Strong BUY Signal** - Expected rise of {predicted_change:.2f}%")
-                    elif predicted_change > 0:
-                        st.info(f"📈 **Mild BUY/HOLD** - Expected rise of {predicted_change:.2f}%")
-                    elif predicted_change < -2:
-                        st.error(f"📉 **Strong SELL Signal** - Expected drop of {abs(predicted_change):.2f}%")
-                    elif predicted_change < 0:
-                        st.warning(f"📉 **Mild SELL/HOLD** - Expected drop of {abs(predicted_change):.2f}%")
-                    else:
-                        st.info("➡️ **Neutral** - Minimal price change predicted")
+                    if last_known_close > 0:
+                        predicted_change = ((forecasted_price - last_known_close) / last_known_close) * 100
+                        
+                        col_f1, col_f2, col_f3 = st.columns(3)
+                        col_f1.metric("Last Known Close", f"₹{last_known_close:.2f}")
+                        col_f2.metric(f"Predicted Price ({forecast.get('horizon', 5)} periods)", 
+                                             f"₹{forecasted_price:.2f}", 
+                                             delta=f"{predicted_change:.2f}%")
+                        col_f3.metric("Forecast Date", 
+                                             (historical_data.index[-1] + timedelta(days=forecast.get('horizon', 5))).strftime('%Y-%m-%d'))
+                        
+                        if forecast.get('rl_applied', False):
+                            base_pred = forecast.get('base_prediction', forecasted_price)
+                            rl_correction = forecasted_price - base_pred
+                            st.info(f"🤖 RL Correction Applied: ₹{rl_correction:+.2f} from base prediction")
+                        
+                        if predicted_change > 2:
+                            st.success(f"📈 **Strong BUY Signal** - Expected rise of {predicted_change:.2f}%")
+                        elif predicted_change > 0:
+                            st.info(f"📈 **Mild BUY/HOLD** - Expected rise of {predicted_change:.2f}%")
+                        elif predicted_change < -2:
+                            st.error(f"📉 **Strong SELL Signal** - Expected drop of {abs(predicted_change):.2f}%")
+                        elif predicted_change < 0:
+                            st.warning(f"📉 **Mild SELL/HOLD** - Expected drop of {abs(predicted_change):.2f}%")
+                        else:
+                            st.info("➡️ **Neutral** - Minimal price change predicted")
 
         # Display RL Learning History
         if st.session_state["rl_memory"] and len(st.session_state["rl_memory"]) > 5:
